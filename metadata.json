@@ -1,0 +1,11 @@
+{
+  "name": "Vinns Studio — Local & Cloud AI Workspace",
+  "description": "Production-grade Local AI & Multi-Provider Web UI for LM Studio, Ollama, Cloudflare Tunnel, OpenRouter, and Google Gemini with VRAM management, Role Library, and Multimodal Input.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
