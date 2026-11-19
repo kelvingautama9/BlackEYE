@@ -127,6 +127,22 @@ export const DEFAULT_FOLDERS: ChatFolder[] = [
 
 export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
   {
+    id: 'gemini-2.5-flash',
+    name: 'gemini-2.5-flash',
+    provider: 'gemini',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Gemini 2.5 Flash',
+  },
+  {
+    id: 'gemini-2.5-pro',
+    name: 'gemini-2.5-pro',
+    provider: 'gemini',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Gemini 2.5 Pro',
+  },
+  {
     id: 'gemini-4-hydrogen',
     name: 'gemini-4-hydrogen',
     provider: 'gemini',
@@ -143,20 +159,20 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     badgeText: 'Fast Lite',
   },
   {
-    id: 'qwen/qwen-2.5-coder-32b-instruct:free',
-    name: 'qwen/qwen-2.5-coder-32b-instruct:free',
-    provider: 'openrouter',
-    providerFormat: 'cloud',
-    isLoaded: true,
-    badgeText: 'OpenRouter Free',
-  },
-  {
     id: 'deepseek/deepseek-r1:free',
     name: 'deepseek/deepseek-r1:free',
     provider: 'openrouter',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Reasoning Free',
+    badgeText: 'Reasoning Cloud',
+  },
+  {
+    id: 'qwen/qwen-2.5-coder-32b-instruct:free',
+    name: 'qwen/qwen-2.5-coder-32b-instruct:free',
+    provider: 'openrouter',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Coder Cloud',
   },
   {
     id: 'google/gemma-3-27b-it:free',
@@ -164,7 +180,7 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     provider: 'openrouter',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'OpenRouter Free',
+    badgeText: 'Gemma 3 Cloud',
   },
 ];
 

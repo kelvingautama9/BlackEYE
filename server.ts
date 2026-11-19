@@ -407,13 +407,24 @@ app.post('/api/local/stream', async (req: Request, res: Response) => {
   }
 });
 
-// 5. POST /api/gemini/stream (Server-Side Google Gemini API using @google/genai)
+// 5. POST /api/gemini/stream (Server-Side Google Gemini API with automatic model fallback)
+const FALLBACK_GEMINI_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+];
+
 app.post('/api/gemini/stream', async (req: Request, res: Response) => {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey =
+      process.env.GEMINI_API_KEY ||
+      process.env.VITE_GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY;
     if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
       return res.status(400).json({
-        error: 'GEMINI_API_KEY belum dikonfigurasi di environment server. Silakan gunakan Local LM atau atur GEMINI_API_KEY di panel Secrets.',
+        error:
+          'GEMINI_API_KEY belum dikonfigurasi di environment server. Silakan gunakan Local LM atau atur GEMINI_API_KEY di Environment Variables.',
       });
     }
 
@@ -426,17 +437,200 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
       },
     });
 
-    const { model, messages, systemPrompt, webSearch } = req.body as {
+    const { model, messages = [], systemPrompt, webSearch } = req.body as {
       model?: string;
       messages: Array<{ role: string; content: string; images?: string[] }>;
       systemPrompt?: string;
       webSearch?: boolean;
     };
 
-    const targetModel = model || 'gemini-4-hydrogen';
+    const requestedModel = model || 'gemini-2.5-flash';
+    const candidateModels = [
+      requestedModel,
+      ...FALLBACK_GEMINI_MODELS.filter((m) => m !== requestedModel),
+    ];
 
     // Convert conversation history into contents format for @google/genai
     const contents = messages.map((m) => {
+      const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+      if (m.images && m.images.length > 0) {
+        m.images.forEach((dataUrl) => {
+          const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+          if (match) {
+            parts.push({
+              inlineData: {
+                mimeType: match[1],
+                data: match[2],
+              },
+            });
+          }
+        });
+      }
+      parts.push({ text: m.content || 'Jelaskan lampiran ini.' });
+      return {
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts,
+      };
+    });
+
+    const baseConfig: Record<string, unknown> = {};
+    if (systemPrompt) {
+      baseConfig.systemInstruction = systemPrompt;
+    }
+
+    let streamResponse: AsyncGenerator<{ text?: string }, void, unknown> | null = null;
+    let lastError: unknown = null;
+
+    for (const candidateModel of candidateModels) {
+      try {
+        const config = { ...baseConfig };
+        if (webSearch) {
+          config.tools = [{ googleSearch: {} }];
+        }
+        streamResponse = (await ai.models.generateContentStream({
+          model: candidateModel,
+          contents,
+          config,
+        })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+        break;
+      } catch (err: unknown) {
+        lastError = err;
+        if (webSearch) {
+          try {
+            streamResponse = (await ai.models.generateContentStream({
+              model: candidateModel,
+              contents,
+              config: baseConfig,
+            })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+            break;
+          } catch (retryErr: unknown) {
+            lastError = retryErr;
+          }
+        }
+      }
+    }
+
+    if (!streamResponse) {
+      const errMsg =
+        lastError instanceof Error ? lastError.message : 'Gagal memulai stream Gemini API';
+      return res.status(500).json({ error: errMsg });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+
+    for await (const chunk of streamResponse) {
+      const text = chunk.text;
+      if (text) {
+        const ssePayload = JSON.stringify({
+          choices: [{ delta: { content: text } }],
+        });
+        res.write(`data: ${ssePayload}\n\n`);
+      }
+    }
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Google Gemini API Error';
+    if (!res.headersSent) {
+      res.status(500).json({ error: message });
+    } else {
+      const errPayload = JSON.stringify({
+        choices: [{ delta: { content: `\n\n**[Error Gemini API]:** ${message}` } }],
+      });
+      res.write(`data: ${errPayload}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+  }
+});
+
+// 6. POST /api/openrouter/stream (OpenRouter proxy with automatic GEMINI_API_KEY fallback)
+app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
+  try {
+    const {
+      apiKey: clientOrKey,
+      payload = {},
+      messages: rawMessages = [],
+      systemPrompt,
+    } = req.body as {
+      apiKey?: string;
+      payload?: Record<string, unknown>;
+      messages?: Array<{ role: string; content: string; images?: string[] }>;
+      systemPrompt?: string;
+    };
+
+    const openRouterKey = (
+      clientOrKey ||
+      process.env.OPENROUTER_API_KEY ||
+      process.env.VITE_OPENROUTER_API_KEY ||
+      ''
+    ).trim();
+
+    if (openRouterKey) {
+      const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${openRouterKey}`,
+          'HTTP-Referer': process.env.APP_URL || 'https://vinns.my.id',
+          'X-Title': 'Vinns Studio AI',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (upstream.ok) {
+        if (!payload.stream) {
+          const data = await upstream.json();
+          return res.json(data);
+        }
+
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+
+        if (!upstream.body) {
+          res.end();
+          return;
+        }
+
+        const reader = upstream.body.getReader();
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(decoder.decode(value, { stream: true }));
+        }
+        res.end();
+        return;
+      }
+    }
+
+    // Automatic Fallback to GEMINI_API_KEY when OpenRouter key is not set
+    const geminiKey =
+      process.env.GEMINI_API_KEY ||
+      process.env.VITE_GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY;
+
+    if (!geminiKey || geminiKey === 'MY_GEMINI_API_KEY') {
+      return res.status(401).json({
+        error:
+          'Model OpenRouter membutuhkan OPENROUTER_API_KEY, atau konfigurasi GEMINI_API_KEY di Environment Variables sebagai Cloud AI utama.',
+      });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey: geminiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const contents = rawMessages.map((m) => {
       const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
       if (m.images && m.images.length > 0) {
         m.images.forEach((dataUrl) => {
@@ -462,19 +656,32 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
     if (systemPrompt) {
       config.systemInstruction = systemPrompt;
     }
-    if (webSearch) {
-      config.tools = [{ googleSearch: {} }];
+
+    let streamResponse: AsyncGenerator<{ text?: string }, void, unknown> | null = null;
+    let lastError: unknown = null;
+
+    for (const candidateModel of FALLBACK_GEMINI_MODELS) {
+      try {
+        streamResponse = (await ai.models.generateContentStream({
+          model: candidateModel,
+          contents,
+          config,
+        })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+        break;
+      } catch (err: unknown) {
+        lastError = err;
+      }
+    }
+
+    if (!streamResponse) {
+      const errMsg =
+        lastError instanceof Error ? lastError.message : 'Gagal memulai Cloud AI stream';
+      return res.status(500).json({ error: errMsg });
     }
 
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-
-    const streamResponse = await ai.models.generateContentStream({
-      model: targetModel,
-      contents,
-      config,
-    });
 
     for await (const chunk of streamResponse) {
       const text = chunk.text;
@@ -489,15 +696,10 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
     res.write('data: [DONE]\n\n');
     res.end();
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Google Gemini API Error';
+    const message = err instanceof Error ? err.message : 'Cloud AI Error';
     if (!res.headersSent) {
       res.status(500).json({ error: message });
     } else {
-      const errPayload = JSON.stringify({
-        choices: [{ delta: { content: `\n\n**[Error Gemini API]:** ${message}` } }],
-      });
-      res.write(`data: ${errPayload}\n\n`);
-      res.write('data: [DONE]\n\n');
       res.end();
     }
   }

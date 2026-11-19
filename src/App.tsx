@@ -780,13 +780,13 @@ export default function App() {
         params.contextWindow
       );
 
-      // 1. GOOGLE GEMINI PROVIDER (Server-Side via /api/gemini/stream)
+      // 1. GOOGLE GEMINI PROVIDER (Server-Side / Vercel Serverless via /api/gemini/stream)
       if (activeProvider === 'gemini') {
         const res = await fetch('/api/gemini/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: activeModel || 'gemini-4-hydrogen',
+            model: activeModel || 'gemini-2.5-flash',
             systemPrompt: effectiveSystemPrompt,
             webSearch: webSearchEnabled,
             messages: budgetedHistory.map((m) => ({
@@ -824,8 +824,91 @@ export default function App() {
             }
           }
         }
+      } else if (activeProvider === 'openrouter') {
+        // 2. OPENROUTER CLOUD PROVIDER (Server-Side / Vercel Serverless via /api/openrouter/stream with automatic GEMINI_API_KEY fallback)
+        const apiMessages: Array<Record<string, unknown>> = [];
+        if (effectiveSystemPrompt) {
+          apiMessages.push({ role: 'system', content: effectiveSystemPrompt });
+        }
+
+        budgetedHistory.forEach((m) => {
+          if (m.images && m.images.length > 0) {
+            const contentArr: Array<Record<string, unknown>> = [
+              { type: 'text', text: m.content || 'Tolong jelaskan gambar ini.' },
+            ];
+            m.images.forEach((imgUrl) => {
+              contentArr.push({ type: 'image_url', image_url: { url: imgUrl } });
+            });
+            apiMessages.push({ role: m.role, content: contentArr });
+          } else {
+            apiMessages.push({ role: m.role, content: m.content });
+          }
+        });
+
+        const payload: Record<string, unknown> = {
+          model: activeModel,
+          messages: apiMessages,
+          temperature: params.temperature,
+          top_p: params.topP,
+          frequency_penalty: params.frequencyPenalty,
+          presence_penalty: params.presencePenalty,
+          stream: true,
+        };
+
+        if (params.maxTokens !== -1 && params.maxTokens > 0) {
+          payload.max_tokens = params.maxTokens;
+        }
+
+        const res = await fetch('/api/openrouter/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            apiKey: params.openRouterApiKey,
+            payload,
+            systemPrompt: effectiveSystemPrompt,
+            messages: budgetedHistory.map((m) => ({
+              role: m.role,
+              content: m.content,
+              images: m.images,
+            })),
+          }),
+          signal: abortController.signal,
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+          throw new Error(errData.error || `Cloud AI Error (${res.status})`);
+        }
+
+        const reader = res.body?.getReader();
+        const decoder = new TextDecoder();
+        if (reader) {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = decoder.decode(value, { stream: true });
+            for (const line of chunk.split('\n')) {
+              const trimmed = line.trim();
+              if (!trimmed || !trimmed.startsWith('data: ')) continue;
+              const raw = trimmed.slice(6).trim();
+              if (raw === '[DONE]') break;
+              try {
+                const parsed = JSON.parse(raw);
+                const delta = parsed.choices?.[0]?.delta;
+                if (delta?.reasoning_content) {
+                  targetReasoning += delta.reasoning_content;
+                }
+                if (delta?.content) {
+                  targetText += delta.content;
+                }
+              } catch {
+                // ignore partial line
+              }
+            }
+          }
+        }
       } else {
-        // 2. LOCAL LM (LM Studio / Ollama / Cloudflare Tunnel) OR OPENROUTER
+        // 3. LOCAL LM (LM Studio / Ollama / Cloudflare Tunnel)
         const apiMessages: Array<Record<string, unknown>> = [];
         if (effectiveSystemPrompt) {
           apiMessages.push({ role: 'system', content: effectiveSystemPrompt });
@@ -859,12 +942,8 @@ export default function App() {
           payload.max_tokens = params.maxTokens;
         }
 
-        const targetEndpoint =
-          activeProvider === 'openrouter'
-            ? 'https://openrouter.ai/api'
-            : params.serverUrl.trim().replace(/\/+$/, '');
-        const targetKey =
-          activeProvider === 'openrouter' ? params.openRouterApiKey : params.apiKey;
+        const targetEndpoint = params.serverUrl.trim().replace(/\/+$/, '');
+        const targetKey = params.apiKey;
 
         // Try direct browser fetch first (just like original ai.html), with automatic rescue via /api/local/stream on CORS/Mixed-Content failure!
         let res: Response | null = null;
@@ -959,8 +1038,14 @@ export default function App() {
       } else {
         const errMsg = err instanceof Error ? err.message : 'Koneksi gagal';
         showToast('error', errMsg);
+        const targetLabel =
+          activeProvider === 'gemini'
+            ? 'Google Gemini Cloud API (/api/gemini/stream)'
+            : activeProvider === 'openrouter'
+            ? 'Cloud AI Proxy (/api/openrouter/stream)'
+            : params.serverUrl;
         updateAssistantInThread(
-          `**Koneksi Terputus / Gagal**\n\nGagal terhubung ke \`${params.serverUrl}\`.\n\nDetail Error: \`${errMsg}\``,
+          `**Koneksi Terputus / Gagal**\n\nGagal terhubung ke \`${targetLabel}\`.\n\nDetail Error: \`${errMsg}\``,
           targetReasoning
         );
       }
@@ -1224,7 +1309,16 @@ export default function App() {
                 isOpen={modelPickerOpen}
                 onClose={() => setModelPickerOpen(false)}
                 activeProvider={activeProvider}
-                setActiveProvider={setActiveProvider}
+                setActiveProvider={(nextProvider) => {
+                  setActiveProvider(nextProvider);
+                  const pool =
+                    nextProvider === 'local'
+                      ? localModels
+                      : DEFAULT_CLOUD_MODELS.filter((m) => m.provider === nextProvider);
+                  if (pool.length > 0 && !pool.some((m) => m.id === activeModel)) {
+                    setActiveModel(pool[0].id);
+                  }
+                }}
                 activeModel={activeModel}
                 onSelectModel={handleSelectModel}
                 localModels={localModels}
