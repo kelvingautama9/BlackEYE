@@ -407,20 +407,252 @@ app.post('/api/local/stream', async (req: Request, res: Response) => {
   }
 });
 
-// 5. POST /api/gemini/stream (Server-Side Google Gemini API with automatic model fallback)
+// 5. GET /api/cloud/models (Live Discovery of Accessible Gemini & OpenRouter Free Models)
 const FALLBACK_GEMINI_MODELS = [
   'gemini-2.5-flash',
-  'gemini-2.0-flash',
   'gemini-4-hydrogen',
+  'gemini-2.5-flash-lite',
   'gemini-3.1-flash-lite',
+  'gemini-2.5-pro',
+  'gemma-3-27b-it',
 ];
 
+const FALLBACK_OPENROUTER_MODELS = [
+  'openrouter/free',
+  'google/gemma-4-31b-it:free',
+  'google/gemma-4-26b-a4b-it:free',
+  'nvidia/nemotron-3.5-lightning:free',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+  'cohere/north-mini-code:free',
+];
+
+function getCleanServerGeminiKey(): string {
+  const raw =
+    process.env.GEMINI_API_KEY ||
+    process.env.VITE_GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY ||
+    process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
+    '';
+  return raw.trim().replace(/^["']|["']$/g, '').trim();
+}
+
+function createServerGeminiClient(apiKey: string): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function buildNormalizedContents(
+  messages: Array<{ role: string; content: string; images?: string[] }>
+) {
+  const cleaned = (messages || []).filter(
+    (m) =>
+      m &&
+      typeof m.content === 'string' &&
+      !m.content.startsWith('**Koneksi Terputus / Gagal**') &&
+      !m.content.startsWith('⚠️ **Koneksi Terputus / Gagal**')
+  );
+
+  const rawTurns = cleaned.map((m) => {
+    const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
+    if (m.images && m.images.length > 0) {
+      m.images.forEach((dataUrl) => {
+        const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+        if (match) {
+          parts.push({
+            inlineData: {
+              mimeType: match[1],
+              data: match[2],
+            },
+          });
+        }
+      });
+    }
+    parts.push({ text: (m.content || '').trim() || 'Jelaskan lampiran ini.' });
+    return {
+      role: m.role === 'assistant' || m.role === 'model' ? 'model' : 'user',
+      parts,
+    };
+  });
+
+  while (rawTurns.length > 0 && rawTurns[0].role !== 'user') {
+    rawTurns.shift();
+  }
+
+  const merged: Array<{
+    role: string;
+    parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
+  }> = [];
+
+  for (const turn of rawTurns) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === turn.role) {
+      last.parts.push(...turn.parts);
+    } else {
+      merged.push({ role: turn.role, parts: [...turn.parts] });
+    }
+  }
+
+  if (merged.length === 0) {
+    merged.push({
+      role: 'user',
+      parts: [{ text: 'Halo' }],
+    });
+  }
+
+  return merged;
+}
+
+app.get('/api/cloud/models', async (_req: Request, res: Response) => {
+  const geminiKey = getCleanServerGeminiKey();
+  const openRouterKey = (
+    process.env.OPENROUTER_API_KEY ||
+    process.env.VITE_OPENROUTER_API_KEY ||
+    ''
+  ).trim();
+
+  let geminiList = FALLBACK_GEMINI_MODELS.slice(0, 5).map((id) => ({
+    id,
+    name: id,
+    provider: 'gemini' as const,
+    providerFormat: 'cloud' as const,
+    isLoaded: true,
+    badgeText: id.includes('pro')
+      ? 'Deep Reasoning'
+      : id.includes('lite')
+      ? 'Ultra Cepat'
+      : 'Cepat & Stabil',
+  }));
+
+  let openRouterList = FALLBACK_OPENROUTER_MODELS.map((id) => ({
+    id,
+    name: id,
+    provider: 'openrouter' as const,
+    providerFormat: 'cloud' as const,
+    isLoaded: true,
+    badgeText: id === 'openrouter/free' ? 'Auto Router' : 'Live Free',
+  }));
+
+  const tasks: Promise<void>[] = [];
+
+  if (geminiKey && geminiKey !== 'MY_GEMINI_API_KEY') {
+    tasks.push(
+      (async () => {
+        try {
+          const r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models?pageSize=100&key=${encodeURIComponent(
+              geminiKey
+            )}`,
+            {
+              headers: { 'User-Agent': 'aistudio-build' },
+              signal: AbortSignal.timeout(4500),
+            }
+          );
+          if (!r.ok) return;
+          const data = (await r.json()) as {
+            models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+          };
+          const discovered = (data.models || [])
+            .filter(
+              (m) =>
+                m.name &&
+                Array.isArray(m.supportedGenerationMethods) &&
+                m.supportedGenerationMethods.includes('generateContent')
+            )
+            .map((m) => (m.name || '').replace(/^models\//, ''))
+            .filter(
+              (id) =>
+                /^(gemini|gemma)/i.test(id) &&
+                !/^gemini-(1\.5|2\.0|pro$)/i.test(id) &&
+                !/(embedding|imagen|veo|tts|audio|live|aqa|robotics|computer-use|vision-001|001$)/i.test(
+                  id
+                )
+            );
+          if (discovered.length > 0) {
+            const unique = Array.from(new Set(discovered));
+            unique.sort((a, b) => {
+              const ia = FALLBACK_GEMINI_MODELS.indexOf(a);
+              const ib = FALLBACK_GEMINI_MODELS.indexOf(b);
+              if (ia !== -1 && ib !== -1) return ia - ib;
+              if (ia !== -1) return -1;
+              if (ib !== -1) return 1;
+              return b.localeCompare(a);
+            });
+            geminiList = unique.slice(0, 10).map((id) => ({
+              id,
+              name: id,
+              provider: 'gemini' as const,
+              providerFormat: 'cloud' as const,
+              isLoaded: true,
+              badgeText: id.includes('pro')
+                ? 'Deep Reasoning'
+                : id.includes('lite')
+                ? 'Ultra Cepat'
+                : 'Gemini Live',
+            }));
+          }
+        } catch {
+          // keep defaults
+        }
+      })()
+    );
+  }
+
+  tasks.push(
+    (async () => {
+      try {
+        const r = await fetch('https://openrouter.ai/api/v1/models', {
+          signal: AbortSignal.timeout(4500),
+        });
+        if (!r.ok) return;
+        const data = (await r.json()) as { data?: Array<{ id?: string }> };
+        const liveFree = (data.data || [])
+          .map((m) => m.id || '')
+          .filter((id) => id === 'openrouter/free' || id.endsWith(':free'));
+        if (liveFree.length > 0) {
+          const sorted = Array.from(new Set(liveFree)).sort((a, b) => {
+            const ia = FALLBACK_OPENROUTER_MODELS.indexOf(a);
+            const ib = FALLBACK_OPENROUTER_MODELS.indexOf(b);
+            if (ia !== -1 && ib !== -1) return ia - ib;
+            if (ia !== -1) return -1;
+            if (ib !== -1) return 1;
+            return a.localeCompare(b);
+          });
+          openRouterList = sorted.slice(0, 10).map((id) => ({
+            id,
+            name: id,
+            provider: 'openrouter' as const,
+            providerFormat: 'cloud' as const,
+            isLoaded: true,
+            badgeText: id === 'openrouter/free' ? 'Auto Router' : 'Live Free',
+          }));
+        }
+      } catch {
+        // keep defaults
+      }
+    })()
+  );
+
+  await Promise.allSettled(tasks);
+
+  return res.json({
+    ok: true,
+    geminiConfigured: Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY'),
+    openRouterConfigured: Boolean(openRouterKey),
+    models: [...geminiList, ...openRouterList],
+  });
+});
+
+// 6. POST /api/gemini/stream (Server-Side Google Gemini API with Smart Multi-Model Auto-Fallback)
 app.post('/api/gemini/stream', async (req: Request, res: Response) => {
   try {
-    const apiKey =
-      process.env.GEMINI_API_KEY ||
-      process.env.VITE_GEMINI_API_KEY ||
-      process.env.GOOGLE_API_KEY;
+    const apiKey = getCleanServerGeminiKey();
     if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
       return res.status(400).json({
         error:
@@ -428,50 +660,42 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
       });
     }
 
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
+    const ai = createServerGeminiClient(apiKey);
 
-    const { model, messages = [], systemPrompt, webSearch } = req.body as {
+    const {
+      model,
+      messages = [],
+      systemPrompt,
+      webSearch,
+      deepReasoning,
+      autoFallback = true,
+      skipModels = [],
+    } = req.body as {
       model?: string;
       messages: Array<{ role: string; content: string; images?: string[] }>;
       systemPrompt?: string;
       webSearch?: boolean;
+      deepReasoning?: boolean;
+      autoFallback?: boolean;
+      skipModels?: string[];
     };
 
-    const requestedModel = model || 'gemini-2.5-flash';
-    const candidateModels = [
-      requestedModel,
-      ...FALLBACK_GEMINI_MODELS.filter((m) => m !== requestedModel),
-    ];
+    const originalRequested = (model || 'gemini-2.5-flash').trim();
+    const primaryModel = originalRequested;
+    const skipSet = new Set(Array.isArray(skipModels) ? skipModels : []);
 
-    // Convert conversation history into contents format for @google/genai
-    const contents = messages.map((m) => {
-      const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-      if (m.images && m.images.length > 0) {
-        m.images.forEach((dataUrl) => {
-          const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-          if (match) {
-            parts.push({
-              inlineData: {
-                mimeType: match[1],
-                data: match[2],
-              },
-            });
-          }
-        });
+    const candidateModels: string[] = [];
+    if (!skipSet.has(primaryModel)) candidateModels.push(primaryModel);
+    if (autoFallback) {
+      for (const m of FALLBACK_GEMINI_MODELS) {
+        if (!candidateModels.includes(m) && !skipSet.has(m)) candidateModels.push(m);
       }
-      parts.push({ text: m.content || 'Jelaskan lampiran ini.' });
-      return {
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts,
-      };
-    });
+      for (const m of [primaryModel, ...FALLBACK_GEMINI_MODELS]) {
+        if (!candidateModels.includes(m)) candidateModels.push(m);
+      }
+    }
+
+    const contents = buildNormalizedContents(messages);
 
     const baseConfig: Record<string, unknown> = {};
     if (systemPrompt) {
@@ -479,12 +703,16 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
     }
 
     let streamResponse: AsyncGenerator<{ text?: string }, void, unknown> | null = null;
+    let activeModelUsed = primaryModel;
     let lastError: unknown = null;
 
     for (const candidateModel of candidateModels) {
       try {
-        const config = { ...baseConfig };
-        if (webSearch) {
+        const config: Record<string, unknown> = { ...baseConfig };
+        if (candidateModel.startsWith('gemini-2.5-flash') && !deepReasoning) {
+          config.thinkingConfig = { thinkingBudget: 0 };
+        }
+        if (webSearch && !candidateModel.startsWith('gemma')) {
           config.tools = [{ googleSearch: {} }];
         }
         streamResponse = (await ai.models.generateContentStream({
@@ -492,9 +720,14 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
           contents,
           config,
         })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+        activeModelUsed = candidateModel;
         break;
       } catch (err: unknown) {
         lastError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (/API_KEY_INVALID|ACCESS_TOKEN_TYPE_UNSUPPORTED|UNAUTHENTICATED/i.test(errMsg)) {
+          break;
+        }
         if (webSearch) {
           try {
             streamResponse = (await ai.models.generateContentStream({
@@ -502,11 +735,13 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
               contents,
               config: baseConfig,
             })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+            activeModelUsed = candidateModel;
             break;
           } catch (retryErr: unknown) {
             lastError = retryErr;
           }
         }
+        if (!autoFallback) break;
       }
     }
 
@@ -519,6 +754,22 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    res.write(': stream-start\n\n');
+
+    const switched = activeModelUsed !== originalRequested;
+    res.write(
+      `data: ${JSON.stringify({
+        meta: {
+          activeModel: activeModelUsed,
+          activeProvider: 'gemini',
+          switched,
+          fromModel: switched ? originalRequested : undefined,
+          reason: switched ? 'Auto-Fallback ke model Gemini yang tersedia' : undefined,
+        },
+      })}\n\n`
+    );
 
     for await (const chunk of streamResponse) {
       const text = chunk.text;
@@ -537,9 +788,7 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
     if (!res.headersSent) {
       res.status(500).json({ error: message });
     } else {
-      const errPayload = JSON.stringify({
-        choices: [{ delta: { content: `\n\n**[Error Gemini API]:** ${message}` } }],
-      });
+      const errPayload = JSON.stringify({ error: message });
       res.write(`data: ${errPayload}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
@@ -547,7 +796,7 @@ app.post('/api/gemini/stream', async (req: Request, res: Response) => {
   }
 });
 
-// 6. POST /api/openrouter/stream (OpenRouter proxy with automatic GEMINI_API_KEY fallback)
+// 7. POST /api/openrouter/stream (OpenRouter proxy with automatic free-model cascade + GEMINI_API_KEY failover)
 app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
   try {
     const {
@@ -555,12 +804,21 @@ app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
       payload = {},
       messages: rawMessages = [],
       systemPrompt,
+      deepReasoning,
+      autoFallback = true,
+      skipModels = [],
     } = req.body as {
       apiKey?: string;
       payload?: Record<string, unknown>;
       messages?: Array<{ role: string; content: string; images?: string[] }>;
       systemPrompt?: string;
+      deepReasoning?: boolean;
+      autoFallback?: boolean;
+      skipModels?: string[];
     };
+
+    const requestedModel = String(payload.model || 'openrouter/free');
+    const skipSet = new Set(Array.isArray(skipModels) ? skipModels : []);
 
     const openRouterKey = (
       clientOrKey ||
@@ -570,49 +828,70 @@ app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
     ).trim();
 
     if (openRouterKey) {
-      const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${openRouterKey}`,
-          'HTTP-Referer': process.env.APP_URL || 'https://vinns.my.id',
-          'X-Title': 'Vinns Studio AI',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      if (upstream.ok) {
-        if (!payload.stream) {
-          const data = await upstream.json();
-          return res.json(data);
+      const orQueue: string[] = [];
+      if (!skipSet.has(requestedModel)) orQueue.push(requestedModel);
+      if (autoFallback) {
+        for (const m of FALLBACK_OPENROUTER_MODELS) {
+          if (!orQueue.includes(m) && !skipSet.has(m)) orQueue.push(m);
         }
+      }
 
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
+      for (const orModel of orQueue) {
+        try {
+          const upstream = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${openRouterKey}`,
+              'HTTP-Referer': process.env.APP_URL || 'https://vinns.my.id',
+              'X-Title': 'Vinns Studio AI',
+            },
+            body: JSON.stringify({ ...payload, model: orModel, stream: true }),
+            signal: AbortSignal.timeout(10000),
+          });
 
-        if (!upstream.body) {
-          res.end();
-          return;
+          if (upstream.ok && upstream.body) {
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders?.();
+
+            const switched = orModel !== requestedModel;
+            res.write(
+              `data: ${JSON.stringify({
+                meta: {
+                  activeModel: orModel,
+                  activeProvider: 'openrouter',
+                  switched,
+                  fromModel: switched ? requestedModel : undefined,
+                  reason: switched ? 'Auto-Fallback ke model OpenRouter aktif' : undefined,
+                },
+              })}\n\n`
+            );
+
+            const reader = upstream.body.getReader();
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              res.write(decoder.decode(value, { stream: true }));
+            }
+            res.end();
+            return;
+          }
+
+          if (upstream.status === 401 || upstream.status === 402 || !autoFallback) {
+            break;
+          }
+        } catch {
+          if (!autoFallback) break;
         }
-
-        const reader = upstream.body.getReader();
-        const decoder = new TextDecoder();
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          res.write(decoder.decode(value, { stream: true }));
-        }
-        res.end();
-        return;
       }
     }
 
-    // Automatic Fallback to GEMINI_API_KEY when OpenRouter key is not set
-    const geminiKey =
-      process.env.GEMINI_API_KEY ||
-      process.env.VITE_GEMINI_API_KEY ||
-      process.env.GOOGLE_API_KEY;
+    // Automatic Fallback to GEMINI_API_KEY when OpenRouter key is not set or fails
+    const geminiKey = getCleanServerGeminiKey();
 
     if (!geminiKey || geminiKey === 'MY_GEMINI_API_KEY') {
       return res.status(401).json({
@@ -621,55 +900,38 @@ app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
       });
     }
 
-    const ai = new GoogleGenAI({
-      apiKey: geminiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
+    const ai = createServerGeminiClient(geminiKey);
 
-    const contents = rawMessages.map((m) => {
-      const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
-      if (m.images && m.images.length > 0) {
-        m.images.forEach((dataUrl) => {
-          const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
-          if (match) {
-            parts.push({
-              inlineData: {
-                mimeType: match[1],
-                data: match[2],
-              },
-            });
-          }
-        });
-      }
-      parts.push({ text: m.content || 'Jelaskan lampiran ini.' });
-      return {
-        role: m.role === 'assistant' ? 'model' : 'user',
-        parts,
-      };
-    });
+    const contents = buildNormalizedContents(rawMessages);
 
-    const config: Record<string, unknown> = {};
+    const baseConfig: Record<string, unknown> = {};
     if (systemPrompt) {
-      config.systemInstruction = systemPrompt;
+      baseConfig.systemInstruction = systemPrompt;
     }
 
     let streamResponse: AsyncGenerator<{ text?: string }, void, unknown> | null = null;
+    let activeModelUsed = FALLBACK_GEMINI_MODELS[0];
     let lastError: unknown = null;
 
     for (const candidateModel of FALLBACK_GEMINI_MODELS) {
       try {
+        const config: Record<string, unknown> = { ...baseConfig };
+        if (candidateModel.startsWith('gemini-2.5-flash') && !deepReasoning) {
+          config.thinkingConfig = { thinkingBudget: 0 };
+        }
         streamResponse = (await ai.models.generateContentStream({
           model: candidateModel,
           contents,
           config,
         })) as unknown as AsyncGenerator<{ text?: string }, void, unknown>;
+        activeModelUsed = candidateModel;
         break;
       } catch (err: unknown) {
         lastError = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (/API_KEY_INVALID|ACCESS_TOKEN_TYPE_UNSUPPORTED|UNAUTHENTICATED/i.test(errMsg)) {
+          break;
+        }
       }
     }
 
@@ -682,6 +944,22 @@ app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+    res.write(': stream-start\n\n');
+    res.write(
+      `data: ${JSON.stringify({
+        meta: {
+          activeModel: activeModelUsed,
+          activeProvider: 'gemini',
+          switched: true,
+          fromModel: requestedModel,
+          reason: openRouterKey
+            ? 'Auto-Failover ke Google Gemini Cloud'
+            : 'OPENROUTER_API_KEY belum diatur — dialihkan ke Google Gemini',
+        },
+      })}\n\n`
+    );
 
     for await (const chunk of streamResponse) {
       const text = chunk.text;
@@ -700,6 +978,7 @@ app.post('/api/openrouter/stream', async (req: Request, res: Response) => {
     if (!res.headersSent) {
       res.status(500).json({ error: message });
     } else {
+      res.write(`data: ${JSON.stringify({ error: message })}\n\ndata: [DONE]\n\n`);
       res.end();
     }
   }

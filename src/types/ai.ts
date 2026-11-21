@@ -31,6 +31,7 @@ export interface ChatMessage {
   time: number;
   model?: string;
   provider?: ProviderType;
+  fallbackNote?: string;
   images?: string[];
   attachments?: Array<{ name: string; type: string; sizeLabel: string }>;
 }
@@ -65,6 +66,7 @@ export interface EngineParameters {
   apiKey: string;
   openRouterApiKey: string;
   autoLoadVram: boolean;
+  autoFallback: boolean;
   temperature: number;
   maxTokens: number; // -1 for Auto
   topP: number;
@@ -132,7 +134,15 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     provider: 'gemini',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Gemini 2.5 Flash',
+    badgeText: 'Cepat & Stabil',
+  },
+  {
+    id: 'gemini-2.5-flash-lite',
+    name: 'gemini-2.5-flash-lite',
+    provider: 'gemini',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Ultra Cepat',
   },
   {
     id: 'gemini-2.5-pro',
@@ -140,7 +150,7 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     provider: 'gemini',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Gemini 2.5 Pro',
+    badgeText: 'Deep Reasoning',
   },
   {
     id: 'gemini-4-hydrogen',
@@ -148,7 +158,7 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     provider: 'gemini',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Cloud Ready',
+    badgeText: 'Gemini 4 Flash',
   },
   {
     id: 'gemini-3.1-flash-lite',
@@ -156,33 +166,48 @@ export const DEFAULT_CLOUD_MODELS: DetectedModel[] = [
     provider: 'gemini',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Fast Lite',
+    badgeText: 'Flash Lite',
   },
   {
-    id: 'deepseek/deepseek-r1:free',
-    name: 'deepseek/deepseek-r1:free',
+    id: 'openrouter/free',
+    name: 'openrouter/free',
     provider: 'openrouter',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Reasoning Cloud',
+    badgeText: 'Auto Router',
   },
   {
-    id: 'qwen/qwen-2.5-coder-32b-instruct:free',
-    name: 'qwen/qwen-2.5-coder-32b-instruct:free',
+    id: 'google/gemma-4-31b-it:free',
+    name: 'google/gemma-4-31b-it:free',
     provider: 'openrouter',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Coder Cloud',
+    badgeText: 'Gemma 4 Free',
   },
   {
-    id: 'google/gemma-3-27b-it:free',
-    name: 'google/gemma-3-27b-it:free',
+    id: 'nvidia/nemotron-3.5-lightning:free',
+    name: 'nvidia/nemotron-3.5-lightning:free',
     provider: 'openrouter',
     providerFormat: 'cloud',
     isLoaded: true,
-    badgeText: 'Gemma 3 Cloud',
+    badgeText: 'Fast Free',
+  },
+  {
+    id: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    name: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+    provider: 'openrouter',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Reasoning Free',
+  },
+  {
+    id: 'cohere/north-mini-code:free',
+    name: 'cohere/north-mini-code:free',
+    provider: 'openrouter',
+    providerFormat: 'cloud',
+    isLoaded: true,
+    badgeText: 'Coder Free',
   },
 ];
 
 export const INITIAL_DEMO_THREADS: ChatThread[] = [];
-

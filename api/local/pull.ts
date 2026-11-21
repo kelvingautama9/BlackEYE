@@ -1,4 +1,6 @@
-import type { Request, Response } from 'express';
+export const config = {
+  runtime: 'edge',
+};
 
 function normalizeEndpoint(raw: string): string {
   let url = (raw || '').trim();
@@ -10,19 +12,32 @@ function normalizeEndpoint(raw: string): string {
   return url.replace(/\/+$/, '').replace(/\/v1$/i, '');
 }
 
-export default async function handler(req: Request, res: Response) {
+export default async function handler(req: Request): Promise<Response> {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
-  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
-  const { endpoint, apiKey, modelName } = body as {
+  let body: {
     endpoint?: string;
     apiKey?: string;
     modelName?: string;
-  };
+  } = {};
+
+  try {
+    body = (await req.json()) || {};
+  } catch {
+    body = {};
+  }
+
+  const { endpoint, apiKey, modelName } = body;
   if (!modelName) {
-    return res.status(400).json({ ok: false, error: 'Nama model wajib diisi (contoh: qwen2.5:3b)' });
+    return new Response(
+      JSON.stringify({ ok: false, error: 'Nama model wajib diisi (contoh: qwen2.5:3b)' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 
   const baseUrl = normalizeEndpoint(endpoint || 'http://localhost:11434');
@@ -37,12 +52,22 @@ export default async function handler(req: Request, res: Response) {
     });
     if (!r.ok) {
       const text = await r.text();
-      return res.status(r.status).json({ ok: false, error: `Gagal menarik model: ${text}` });
+      return new Response(
+        JSON.stringify({ ok: false, error: `Gagal menarik model: ${text}` }),
+        { status: r.status, headers: { 'Content-Type': 'application/json' } }
+      );
     }
     const data = await r.json();
-    return res.json({ ok: true, modelName, data });
+    return new Response(JSON.stringify({ ok: true, modelName, data }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Gagal menghubungi endpoint Ollama /api/pull';
-    return res.status(502).json({ ok: false, error: message });
+    const message =
+      err instanceof Error ? err.message : 'Gagal menghubungi endpoint Ollama /api/pull';
+    return new Response(JSON.stringify({ ok: false, error: message }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }

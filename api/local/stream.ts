@@ -1,4 +1,6 @@
-import type { Request, Response } from 'express';
+export const config = {
+  runtime: 'edge',
+};
 
 function normalizeEndpoint(raw: string): string {
   let url = (raw || '').trim();
@@ -20,18 +22,58 @@ const CLOUDFLARE_ERROR_CODES: Record<number, string> = {
   530: 'Origin DNS / Tunnel Error (530): Daemon cloudflared di PC Anda sedang mati / offline.',
 };
 
-export default async function handler(req: Request, res: Response) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+interface NodeLikeRequest {
+  method?: string;
+  body?: unknown;
+  json?: () => Promise<unknown>;
+}
+
+interface NodeLikeResponse {
+  status: (code: number) => NodeLikeResponse;
+  json: (data: unknown) => void;
+  setHeader: (name: string, value: string) => void;
+  flushHeaders?: () => void;
+  write: (chunk: string) => void;
+  end: () => void;
+  headersSent?: boolean;
+}
+
+export default async function handler(
+  req: Request | NodeLikeRequest,
+  res?: NodeLikeResponse
+): Promise<Response | void> {
+  const isNodeMode = Boolean(res && typeof res.setHeader === 'function');
+  const method = req.method || 'POST';
+
+  if (method !== 'POST') {
+    if (isNodeMode && res) {
+      res.status(405).json({ error: 'Method Not Allowed' });
+      return;
+    }
+    return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
-  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
-  const { endpoint, apiKey, payload } = body as {
+  let body: {
     endpoint?: string;
     apiKey?: string;
-    payload: Record<string, unknown>;
-  };
+    payload?: Record<string, unknown>;
+  } = {};
 
+  try {
+    if (typeof (req as Request).json === 'function' && !isNodeMode) {
+      body = (await (req as Request).json()) || {};
+    } else {
+      const rawBody = (req as NodeLikeRequest).body;
+      body = typeof rawBody === 'string' ? JSON.parse(rawBody) : (rawBody as typeof body) || {};
+    }
+  } catch {
+    body = {};
+  }
+
+  const { endpoint, apiKey, payload = {} } = body;
   const baseUrl = normalizeEndpoint(endpoint || 'https://api.vinns.my.id');
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -55,46 +97,73 @@ export default async function handler(req: Request, res: Response) {
 
     if (!upstream.ok) {
       const errText = await upstream.text();
-      return res.status(upstream.status).json({
+      const errPayload = {
         error:
           CLOUDFLARE_ERROR_CODES[upstream.status] ||
           `Server error (${upstream.status}): ${errText}`,
+      };
+      if (isNodeMode && res) {
+        res.status(upstream.status).json(errPayload);
+        return;
+      }
+      return new Response(JSON.stringify(errPayload), {
+        status: upstream.status,
+        headers: { 'Content-Type': 'application/json' },
       });
     }
 
     if (!payload?.stream) {
       const data = await upstream.json();
-      return res.json(data);
+      if (isNodeMode && res) {
+        res.status(200).json(data);
+        return;
+      }
+      return new Response(JSON.stringify(data), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
 
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-
-    if (!upstream.body) {
+    if (isNodeMode && res) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+      if (!upstream.body) {
+        res.end();
+        return;
+      }
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(decoder.decode(value, { stream: true }));
+      }
       res.end();
       return;
     }
 
-    const reader = upstream.body.getReader();
-    const decoder = new TextDecoder();
-
-    req.on('close', () => {
-      reader.cancel().catch(() => {});
+    return new Response(upstream.body, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
     });
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(decoder.decode(value, { stream: true }));
-    }
-    res.end();
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Gagal terhubung ke server lokal';
-    if (!res.headersSent) {
-      res.status(502).json({ error: `Proxy Error ke ${baseUrl}: ${message}` });
-    } else {
-      res.end();
+    const errPayload = { error: `Proxy Error ke ${baseUrl}: ${message}` };
+    if (isNodeMode && res) {
+      if (!res.headersSent) res.status(502).json(errPayload);
+      else res.end();
+      return;
     }
+    return new Response(JSON.stringify(errPayload), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }

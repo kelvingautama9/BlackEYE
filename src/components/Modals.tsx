@@ -28,15 +28,18 @@ interface ModelPickerPopoverProps {
   isOpen: boolean;
   onClose: () => void;
   activeProvider: ProviderType;
-  setActiveProvider: (p: ProviderType) => void;
   activeModel: string;
   onSelectModel: (model: DetectedModel) => void;
   localModels: DetectedModel[];
   cloudModels: DetectedModel[];
   localFormat: string;
   isScanning: boolean;
+  isScanningCloud?: boolean;
   isLoadingVram: string | null;
+  autoFallback: boolean;
+  onToggleAutoFallback: () => void;
   onScanLocal: () => void;
+  onScanCloud: () => void;
   onOpenServerSettings: () => void;
 }
 
@@ -44,35 +47,47 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
   isOpen,
   onClose,
   activeProvider,
-  setActiveProvider,
   activeModel,
   onSelectModel,
   localModels,
   cloudModels,
   localFormat,
   isScanning,
+  isScanningCloud = false,
   isLoadingVram,
+  autoFallback,
+  onToggleAutoFallback,
   onScanLocal,
+  onScanCloud,
   onOpenServerSettings,
 }) => {
+  // Local tab state so switching tabs to browse NEVER mutates activeProvider until a model is actually selected!
+  const [viewingTab, setViewingTab] = useState<ProviderType>(activeProvider);
+
+  useEffect(() => {
+    if (isOpen) {
+      setViewingTab(activeProvider);
+    }
+  }, [isOpen, activeProvider]);
+
   if (!isOpen) return null;
 
   const filteredModels =
-    activeProvider === 'local'
+    viewingTab === 'local'
       ? localModels
-      : cloudModels.filter((m) => m.provider === activeProvider);
+      : cloudModels.filter((m) => m.provider === viewingTab);
 
   return (
     <>
       <div className="fixed inset-0 z-30" onClick={onClose} />
-      <div className="absolute left-0 top-10 z-40 w-[calc(100vw-24px)] max-w-[360px] sm:w-[380px] sm:max-w-none rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] p-2.5 sm:p-3 shadow-2xl theme-surface">
-        {/* 3 Provider Tabs matching screenshot image_52dc21fa.png */}
+      <div className="absolute left-0 top-10 z-40 w-[calc(100vw-24px)] max-w-[360px] sm:w-[390px] sm:max-w-none rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] p-2.5 sm:p-3 shadow-2xl theme-surface">
+        {/* 3 Provider Tabs */}
         <div className="grid grid-cols-3 gap-1 p-1 rounded-md bg-[var(--bg-muted)] mb-2.5">
           <button
             type="button"
-            onClick={() => setActiveProvider('gemini')}
+            onClick={() => setViewingTab('gemini')}
             className={`py-1.5 px-2 text-xs font-semibold rounded-[4px] btn-tactile whitespace-nowrap ${
-              activeProvider === 'gemini'
+              viewingTab === 'gemini'
                 ? 'bg-[var(--accent)] text-white shadow-xs'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
             }`}
@@ -81,9 +96,9 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => setActiveProvider('openrouter')}
+            onClick={() => setViewingTab('openrouter')}
             className={`py-1.5 px-2 text-xs font-semibold rounded-[4px] btn-tactile whitespace-nowrap ${
-              activeProvider === 'openrouter'
+              viewingTab === 'openrouter'
                 ? 'bg-[var(--accent)] text-white shadow-xs'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
             }`}
@@ -92,9 +107,9 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => setActiveProvider('local')}
+            onClick={() => setViewingTab('local')}
             className={`py-1.5 px-2 text-xs font-semibold rounded-[4px] btn-tactile whitespace-nowrap ${
-              activeProvider === 'local'
+              viewingTab === 'local'
                 ? 'bg-[var(--accent)] text-white shadow-xs'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
             }`}
@@ -110,11 +125,11 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
               DAFTAR MODEL:
             </span>
             <span className="px-1.5 py-0.5 rounded-[3px] font-mono text-[10px] font-medium bg-emerald-500/12 text-emerald-700 dark:text-emerald-300">
-              {activeProvider === 'local' ? localFormat || 'openai-compatible' : activeProvider}
+              {viewingTab === 'local' ? localFormat || 'openai-compatible' : viewingTab}
             </span>
           </div>
 
-          {activeProvider === 'local' && (
+          {viewingTab === 'local' ? (
             <div className="flex items-center gap-2.5">
               <button
                 type="button"
@@ -136,46 +151,62 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                 Atur Server
               </button>
             </div>
+          ) : (
+            <button
+              type="button"
+              onClick={onScanCloud}
+              disabled={isScanningCloud}
+              className="flex items-center gap-1 text-[var(--text-secondary)] hover:text-[var(--text-primary)] font-medium btn-tactile cursor-pointer"
+            >
+              <RefreshCw
+                className={`w-3 h-3 ${isScanningCloud ? 'animate-spin text-[var(--accent)]' : ''}`}
+              />
+              <span>Refresh Live</span>
+            </button>
           )}
         </div>
 
         {/* Model List */}
-        <div className="max-h-64 overflow-y-auto space-y-1 pr-0.5">
+        <div className="max-h-60 overflow-y-auto space-y-1 pr-0.5">
           {filteredModels.length === 0 ? (
             <div className="py-6 px-3 text-center rounded-md bg-[var(--bg-muted)]/50 border border-[var(--border-subtle)]">
               <p className="text-xs text-[var(--text-secondary)] mb-2">
-                Belum ada model lokal terdeteksi dari server.
+                {viewingTab === 'local'
+                  ? 'Belum ada model lokal terdeteksi dari server.'
+                  : 'Belum ada model cloud tersedia.'}
               </p>
               <div className="flex items-center justify-center gap-2">
                 <button
                   type="button"
-                  onClick={onScanLocal}
+                  onClick={viewingTab === 'local' ? onScanLocal : onScanCloud}
                   className="px-2.5 py-1 text-xs font-medium rounded-[4px] bg-[var(--accent)] text-white btn-tactile"
                 >
                   Pindai Ulang
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onClose();
-                    onOpenServerSettings();
-                  }}
-                  className="px-2.5 py-1 text-xs font-medium rounded-[4px] border border-[var(--border-strong)] text-[var(--text-primary)] btn-tactile"
-                >
-                  Atur URL Server
-                </button>
+                {viewingTab === 'local' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenServerSettings();
+                    }}
+                    className="px-2.5 py-1 text-xs font-medium rounded-[4px] border border-[var(--border-strong)] text-[var(--text-primary)] btn-tactile"
+                  >
+                    Atur URL Server
+                  </button>
+                )}
               </div>
             </div>
           ) : (
             filteredModels.map((m) => {
-              const isSelected = activeModel === m.id;
+              const isSelected = activeModel === m.id && activeProvider === m.provider;
               const isBeingLoaded = isLoadingVram === m.id;
               return (
                 <button
-                  key={m.id}
+                  key={`${m.provider}:${m.id}`}
                   type="button"
                   onClick={() => onSelectModel(m)}
-                  className={`w-full flex items-center justify-between gap-2 px-3 py-2.5 rounded-md text-left btn-tactile cursor-pointer border ${
+                  className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-md text-left btn-tactile cursor-pointer border ${
                     isSelected
                       ? 'bg-[var(--bg-active-row)] border-[var(--accent-border)] text-[var(--accent)]'
                       : 'bg-transparent border-transparent hover:bg-[var(--bg-muted)] text-[var(--text-primary)]'
@@ -198,7 +229,7 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
                       </span>
                     ) : m.isLoaded ? (
                       <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-[4px] text-[10px] font-medium bg-emerald-500/15 text-emerald-700 dark:text-emerald-300">
-                        <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                         {m.badgeText || 'VRAM Aktif'}
                       </span>
                     ) : (
@@ -213,6 +244,32 @@ export const ModelPickerPopover: React.FC<ModelPickerPopoverProps> = ({
               );
             })
           )}
+        </div>
+
+        {/* Auto-Fallback Footer Bar */}
+        <div className="mt-2 pt-2 border-t border-[var(--border-subtle)] flex items-center justify-between gap-2 px-1">
+          <div className="min-w-0">
+            <div className="text-[11px] font-semibold text-[var(--text-primary)]">
+              Auto-Fallback Cerdas
+            </div>
+            <div className="text-[10px] text-[var(--text-secondary)] truncate">
+              Otomatis pindah ke model tersedia jika limit/timeout
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onToggleAutoFallback}
+            className={`shrink-0 w-9 h-5 rounded-full transition-colors relative cursor-pointer ${
+              autoFallback ? 'bg-[var(--accent)]' : 'bg-neutral-400/40'
+            }`}
+            aria-label="Toggle Auto-Fallback"
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                autoFallback ? 'translate-x-4' : ''
+              }`}
+            />
+          </button>
         </div>
       </div>
     </>
@@ -712,7 +769,7 @@ export const ServerAndParamsModal: React.FC<ServerAndParamsModalProps> = ({
               {/* Auto-Load VRAM Toggle */}
               <div className="flex items-center justify-between p-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)]/40">
                 <div className="flex items-center gap-2.5">
-                  <Cpu className="w-4 h-4 text-[var(--accent)]" />
+                  <Cpu className="w-4 h-4 text-[var(--accent)] shrink-0" />
                   <div>
                     <div className="text-xs font-semibold text-[var(--text-primary)]">
                       Auto-Load Model ke VRAM saat Dipilih
@@ -725,13 +782,41 @@ export const ServerAndParamsModal: React.FC<ServerAndParamsModalProps> = ({
                 <button
                   type="button"
                   onClick={() => updateParam('autoLoadVram', !params.autoLoadVram)}
-                  className={`w-10 h-5 rounded-full transition-colors relative cursor-pointer ${
+                  className={`shrink-0 w-10 h-5 rounded-full transition-colors relative cursor-pointer ${
                     params.autoLoadVram ? 'bg-[var(--accent)]' : 'bg-neutral-400/40'
                   }`}
                 >
                   <span
                     className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
                       params.autoLoadVram ? 'translate-x-5' : ''
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Smart Auto-Fallback Toggle */}
+              <div className="flex items-center justify-between p-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)]/40">
+                <div className="flex items-center gap-2.5">
+                  <RefreshCw className="w-4 h-4 text-[var(--accent)] shrink-0" />
+                  <div>
+                    <div className="text-xs font-semibold text-[var(--text-primary)]">
+                      Auto-Fallback Cerdas Multi-Model & Provider
+                    </div>
+                    <div className="text-[11px] text-[var(--text-secondary)]">
+                      Otomatis beralih ke model lain yang masih punya kuota/aktif (Gemini, OpenRouter, atau Local LM) jika model utama timeout atau limit habis
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => updateParam('autoFallback', !params.autoFallback)}
+                  className={`shrink-0 w-10 h-5 rounded-full transition-colors relative cursor-pointer ${
+                    params.autoFallback ? 'bg-[var(--accent)]' : 'bg-neutral-400/40'
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                      params.autoFallback ? 'translate-x-5' : ''
                     }`}
                   />
                 </button>

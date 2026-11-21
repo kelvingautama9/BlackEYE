@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
 import {
   Menu,
   ChevronDown,
@@ -108,11 +109,13 @@ export default function App() {
     const savedServer = localStorage.getItem('lms_server') || 'https://api.vinns.my.id';
     const savedKey = localStorage.getItem('lms_apikey') || '';
     const savedOrKey = localStorage.getItem('lms_openrouter_key') || '';
+    const savedAutoFallback = localStorage.getItem('vinns_autofallback');
     return {
       serverUrl: savedServer,
       apiKey: savedKey,
       openRouterApiKey: savedOrKey,
       autoLoadVram: true,
+      autoFallback: savedAutoFallback === null ? true : savedAutoFallback === 'true',
       temperature: 0.7,
       maxTokens: -1,
       topP: 0.95,
@@ -130,7 +133,8 @@ export default function App() {
     localStorage.setItem('lms_server', params.serverUrl);
     localStorage.setItem('lms_apikey', params.apiKey);
     localStorage.setItem('lms_openrouter_key', params.openRouterApiKey);
-  }, [params.serverUrl, params.apiKey, params.openRouterApiKey]);
+    localStorage.setItem('vinns_autofallback', String(params.autoFallback));
+  }, [params.serverUrl, params.apiKey, params.openRouterApiKey, params.autoFallback]);
 
   // 3. Roles & System Prompt
   const [roles, setRoles] = useState<RoleItem[]>(() => {
@@ -289,8 +293,10 @@ export default function App() {
     },
   ]);
   const [localFormat, setLocalFormat] = useState<string>('openai-compatible');
+  const [cloudModels, setCloudModels] = useState<DetectedModel[]>(DEFAULT_CLOUD_MODELS);
   const [activeModel, setActiveModel] = useState<string>('qwen/qwen3.5-9b');
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [isScanningCloud, setIsScanningCloud] = useState<boolean>(false);
   const [isLoadingVram, setIsLoadingVram] = useState<string | null>(null);
   const [isPulling, setIsPulling] = useState<boolean>(false);
   const [serverStatus, setServerStatus] = useState<{
@@ -298,6 +304,8 @@ export default function App() {
     latencyMs?: number;
     error?: string;
   }>({ online: false });
+  // Cooldown tracker for models that recently hit 429/timeout (modelId -> expiry timestamp ms)
+  const modelCooldownRef = useRef<Record<string, number>>({});
 
   // 6. UI Layout & Modal States
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => window.innerWidth >= 1024);
@@ -440,8 +448,33 @@ export default function App() {
     [params.serverUrl, params.apiKey, showToast]
   );
 
+  const scanCloudModels = useCallback(
+    async (silent = false) => {
+      setIsScanningCloud(true);
+      try {
+        const res = await fetch('/api/cloud/models');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.ok && Array.isArray(data.models) && data.models.length > 0) {
+          setCloudModels(data.models);
+          if (!silent) {
+            showToast('success', `Daftar model Cloud diperbarui (${data.models.length} model aktif)`);
+          }
+        }
+      } catch {
+        if (!silent) {
+          showToast('error', 'Gagal menyegarkan daftar model Cloud, menggunakan daftar bawaan');
+        }
+      } finally {
+        setIsScanningCloud(false);
+      }
+    },
+    [showToast]
+  );
+
   useEffect(() => {
     scanLocalServer(true);
+    scanCloudModels(true);
   }, []);
 
   // Select Model & Auto-Load VRAM if local
@@ -708,7 +741,7 @@ export default function App() {
   };
 
   // ============================================================
-  // SEND MESSAGE & 120FPS STREAMING ENGINE
+  // SEND MESSAGE & 120FPS STREAMING ENGINE WITH SMART AUTO-FALLBACK
   // ============================================================
   const streamAiCompletion = async (
     threadId: string,
@@ -719,14 +752,45 @@ export default function App() {
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
+    // Defensively infer true provider from activeModel so tab switches or stale state never route Cloud models to Local server
+    const resolveEffectiveProvider = (): ProviderType => {
+      const m = (activeModel || '').trim();
+      if (/^(gemini-|gemma-3-)/i.test(m)) return 'gemini';
+      if (m === 'openrouter/free' || /:free$/i.test(m)) return 'openrouter';
+      if (cloudModels.some((cm) => cm.id === m && cm.provider === 'gemini')) return 'gemini';
+      if (cloudModels.some((cm) => cm.id === m && cm.provider === 'openrouter')) return 'openrouter';
+      return activeProvider;
+    };
+
+    const effectiveProvider = resolveEffectiveProvider();
+
+    // Active cooldown list (models that recently hit 429/timeout within the last 60s)
+    const now = Date.now();
+    const activeCooldownModels = Object.entries(modelCooldownRef.current)
+      .filter(([, expiresAt]) => expiresAt > now)
+      .map(([id]) => id);
+
+    const markModelCooldown = (modelId: string, durationMs = 60000) => {
+      if (modelId) {
+        modelCooldownRef.current[modelId] = Date.now() + durationMs;
+      }
+    };
+
     // 120fps requestAnimationFrame typewriter state
     let targetText = '';
     let displayedText = '';
     let targetReasoning = '';
     let streamFinished = false;
     let rafId: number | null = null;
+    let resolvedModelName = activeModel;
+    let resolvedProvider: ProviderType = effectiveProvider;
+    let resolvedFallbackNote = '';
 
-    const updateAssistantInThread = (content: string, reasoning?: string) => {
+    const updateAssistantInThread = (
+      content: string,
+      reasoning?: string,
+      metaOverride?: { model?: string; provider?: ProviderType; fallbackNote?: string }
+    ) => {
       setThreads((prev) =>
         prev.map((t) => {
           if (t.id !== threadId) return t;
@@ -735,7 +799,17 @@ export default function App() {
             updated: Date.now(),
             messages: t.messages.map((m) =>
               m.id === assistantMsgId
-                ? { ...m, content, reasoning: reasoning || m.reasoning }
+                ? {
+                    ...m,
+                    content,
+                    reasoning: reasoning || m.reasoning,
+                    model: metaOverride?.model || resolvedModelName || m.model,
+                    provider: metaOverride?.provider || resolvedProvider || m.provider,
+                    fallbackNote:
+                      metaOverride?.fallbackNote !== undefined
+                        ? metaOverride.fallbackNote
+                        : resolvedFallbackNote || m.fallbackNote,
+                  }
                 : m
             ),
           };
@@ -780,15 +854,149 @@ export default function App() {
         params.contextWindow
       );
 
-      // 1. GOOGLE GEMINI PROVIDER (Server-Side / Vercel Serverless via /api/gemini/stream)
-      if (activeProvider === 'gemini') {
+      // Helper to consume an SSE stream with client-side first-token stall watchdog
+      const consumeCloudSseStream = async (res: Response, stallTimeoutMs = 24000) => {
+        const reader = res.body?.getReader();
+        const decoder = new TextDecoder();
+        if (!reader) return;
+
+        let lineBuffer = '';
+        let receivedAnyContent = false;
+        let stallAborted = false;
+
+        const stallTimer = setTimeout(() => {
+          if (!receivedAnyContent) {
+            stallAborted = true;
+            reader.cancel().catch(() => {});
+          }
+        }, stallTimeoutMs);
+
+        const processSseLine = (line: string) => {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) return;
+          const raw = trimmed.slice(5).trim();
+          if (!raw || raw === '[DONE]') return;
+
+          let parsed: {
+            error?: string | { message?: string };
+            meta?: {
+              activeModel?: string;
+              activeProvider?: ProviderType;
+              switched?: boolean;
+              fromModel?: string;
+              reason?: string;
+            };
+            choices?: Array<{
+              delta?: { content?: string; reasoning_content?: string };
+            }>;
+            candidates?: Array<{
+              content?: { parts?: Array<{ text?: string; thought?: boolean }> };
+            }>;
+          } | null = null;
+
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            return;
+          }
+
+          if (parsed?.meta) {
+            if (parsed.meta.activeModel) {
+              resolvedModelName = parsed.meta.activeModel;
+            }
+            if (parsed.meta.activeProvider) {
+              resolvedProvider = parsed.meta.activeProvider;
+            }
+            if (parsed.meta.switched && parsed.meta.activeModel) {
+              if (parsed.meta.fromModel) {
+                markModelCooldown(parsed.meta.fromModel, 60000);
+              }
+              const note = `Auto-Fallback → ${parsed.meta.activeModel}${
+                parsed.meta.reason ? ` (${parsed.meta.reason})` : ''
+              }`;
+              resolvedFallbackNote = note;
+              showToast('success', note);
+              updateAssistantInThread(displayedText, targetReasoning, {
+                model: resolvedModelName,
+                provider: resolvedProvider,
+                fallbackNote: note,
+              });
+            }
+          }
+
+          if (parsed?.error) {
+            const errMsg =
+              typeof parsed.error === 'string'
+                ? parsed.error
+                : parsed.error.message || JSON.stringify(parsed.error);
+            throw new Error(errMsg);
+          }
+
+          const delta = parsed?.choices?.[0]?.delta;
+          if (delta?.reasoning_content) {
+            receivedAnyContent = true;
+            clearTimeout(stallTimer);
+            targetReasoning += delta.reasoning_content;
+          }
+          if (delta?.content) {
+            receivedAnyContent = true;
+            clearTimeout(stallTimer);
+            targetText += delta.content;
+          }
+
+          const parts = parsed?.candidates?.[0]?.content?.parts;
+          if (Array.isArray(parts)) {
+            for (const part of parts) {
+              if (part?.thought && part?.text) {
+                receivedAnyContent = true;
+                clearTimeout(stallTimer);
+                targetReasoning += part.text;
+              } else if (part?.text) {
+                receivedAnyContent = true;
+                clearTimeout(stallTimer);
+                targetText += part.text;
+              }
+            }
+          }
+        };
+
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            lineBuffer += decoder.decode(value, { stream: true });
+            const lines = lineBuffer.split(/\r?\n/);
+            lineBuffer = lines.pop() || '';
+            for (const line of lines) {
+              processSseLine(line);
+            }
+          }
+          if (lineBuffer.trim()) {
+            processSseLine(lineBuffer);
+          }
+        } finally {
+          clearTimeout(stallTimer);
+        }
+
+        if (stallAborted) {
+          throw new Error('Model tidak memberikan respons dalam batas waktu (Timeout)');
+        }
+      };
+
+      // Helper: Execute Gemini Cloud stream (/api/gemini/stream)
+      const executeGeminiStream = async (modelId: string) => {
         const res = await fetch('/api/gemini/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            model: activeModel || 'gemini-2.5-flash',
+            model: modelId || 'gemini-2.5-flash',
             systemPrompt: effectiveSystemPrompt,
             webSearch: webSearchEnabled,
+            deepReasoning: deepReasoningEnabled,
+            temperature: params.temperature,
+            autoFallback: params.autoFallback,
+            openRouterApiKey: params.openRouterApiKey,
+            skipModels: activeCooldownModels,
             messages: budgetedHistory.map((m) => ({
               role: m.role,
               content: m.content,
@@ -803,29 +1011,14 @@ export default function App() {
           throw new Error(errData.error || `Gemini API Error (${res.status})`);
         }
 
-        const reader = res.body?.getReader();
-        const decoder = new TextDecoder();
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            for (const line of chunk.split('\n')) {
-              if (!line.startsWith('data: ')) continue;
-              const raw = line.slice(6).trim();
-              if (raw === '[DONE]') break;
-              try {
-                const parsed = JSON.parse(raw);
-                const delta = parsed.choices?.[0]?.delta?.content || '';
-                if (delta) targetText += delta;
-              } catch {
-                // ignore partial line
-              }
-            }
-          }
+        await consumeCloudSseStream(res);
+        if (!targetText.trim() && !targetReasoning.trim()) {
+          throw new Error('Model tidak mengirimkan jawaban teks (Empty response)');
         }
-      } else if (activeProvider === 'openrouter') {
-        // 2. OPENROUTER CLOUD PROVIDER (Server-Side / Vercel Serverless via /api/openrouter/stream with automatic GEMINI_API_KEY fallback)
+      };
+
+      // Helper: Execute OpenRouter Cloud stream (/api/openrouter/stream)
+      const executeOpenRouterStream = async (modelId: string) => {
         const apiMessages: Array<Record<string, unknown>> = [];
         if (effectiveSystemPrompt) {
           apiMessages.push({ role: 'system', content: effectiveSystemPrompt });
@@ -846,7 +1039,7 @@ export default function App() {
         });
 
         const payload: Record<string, unknown> = {
-          model: activeModel,
+          model: modelId,
           messages: apiMessages,
           temperature: params.temperature,
           top_p: params.topP,
@@ -866,6 +1059,9 @@ export default function App() {
             apiKey: params.openRouterApiKey,
             payload,
             systemPrompt: effectiveSystemPrompt,
+            deepReasoning: deepReasoningEnabled,
+            autoFallback: params.autoFallback,
+            skipModels: activeCooldownModels,
             messages: budgetedHistory.map((m) => ({
               role: m.role,
               content: m.content,
@@ -880,35 +1076,14 @@ export default function App() {
           throw new Error(errData.error || `Cloud AI Error (${res.status})`);
         }
 
-        const reader = res.body?.getReader();
-        const decoder = new TextDecoder();
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            for (const line of chunk.split('\n')) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data: ')) continue;
-              const raw = trimmed.slice(6).trim();
-              if (raw === '[DONE]') break;
-              try {
-                const parsed = JSON.parse(raw);
-                const delta = parsed.choices?.[0]?.delta;
-                if (delta?.reasoning_content) {
-                  targetReasoning += delta.reasoning_content;
-                }
-                if (delta?.content) {
-                  targetText += delta.content;
-                }
-              } catch {
-                // ignore partial line
-              }
-            }
-          }
+        await consumeCloudSseStream(res);
+        if (!targetText.trim() && !targetReasoning.trim()) {
+          throw new Error('Model tidak mengirimkan jawaban teks (Empty response)');
         }
-      } else {
-        // 3. LOCAL LM (LM Studio / Ollama / Cloudflare Tunnel)
+      };
+
+      // Helper: Execute Local LM stream (LM Studio / Ollama / Cloudflare Tunnel)
+      const executeLocalStream = async (modelId: string) => {
         const apiMessages: Array<Record<string, unknown>> = [];
         if (effectiveSystemPrompt) {
           apiMessages.push({ role: 'system', content: effectiveSystemPrompt });
@@ -929,7 +1104,7 @@ export default function App() {
         });
 
         const payload: Record<string, unknown> = {
-          model: activeModel,
+          model: modelId,
           messages: apiMessages,
           temperature: params.temperature,
           top_p: params.topP,
@@ -945,9 +1120,7 @@ export default function App() {
         const targetEndpoint = params.serverUrl.trim().replace(/\/+$/, '');
         const targetKey = params.apiKey;
 
-        // Try direct browser fetch first (just like original ai.html), with automatic rescue via /api/local/stream on CORS/Mixed-Content failure!
         let res: Response | null = null;
-
         try {
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
           if (targetKey) headers['Authorization'] = `Bearer ${targetKey}`;
@@ -959,7 +1132,6 @@ export default function App() {
             signal: abortController.signal,
           });
 
-          // Smart Retry HTTP 400 on LM Studio when max_tokens exceeds context length
           if (!res.ok && res.status === 400 && 'max_tokens' in payload) {
             const retryPayload = { ...payload };
             delete retryPayload.max_tokens;
@@ -974,7 +1146,6 @@ export default function App() {
           if (directErr instanceof Error && directErr.name === 'AbortError') {
             throw directErr;
           }
-          // Auto-Rescue via Backend Proxy (/api/local/stream)
           res = await fetch('/api/local/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -993,55 +1164,113 @@ export default function App() {
         }
 
         if (params.stream && res.body) {
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split('\n');
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || !trimmed.startsWith('data: ')) continue;
-              const dataStr = trimmed.slice(6).trim();
-              if (dataStr === '[DONE]') break;
-              try {
-                const parsed = JSON.parse(dataStr);
-                const delta = parsed.choices?.[0]?.delta;
-                if (delta?.reasoning_content) {
-                  targetReasoning += delta.reasoning_content;
-                }
-                if (delta?.content) {
-                  targetText += delta.content;
-                }
-              } catch {
-                // ignore partial json
-              }
-            }
-          }
+          await consumeCloudSseStream(res, 35000);
         } else {
           const data = await res.json();
           targetText = data.choices?.[0]?.message?.content || '';
           targetReasoning = data.choices?.[0]?.message?.reasoning_content || '';
         }
+
+        if (!targetText.trim() && !targetReasoning.trim()) {
+          throw new Error('Server lokal tidak mengirimkan token jawaban.');
+        }
+      };
+
+      // ============================================================
+      // DISPATCH WITH CROSS-TIER AUTO-FALLBACK ORCHESTRATION
+      // ============================================================
+      if (effectiveProvider === 'gemini') {
+        try {
+          await executeGeminiStream(activeModel || 'gemini-2.5-flash');
+        } catch (geminiErr: unknown) {
+          if (geminiErr instanceof Error && geminiErr.name === 'AbortError') throw geminiErr;
+          markModelCooldown(activeModel, 60000);
+
+          if (params.autoFallback && serverStatus.online && localModels.length > 0) {
+            // Ultimate Cross-Tier Failover: All Cloud APIs failed -> fallback to active Local LM!
+            const localCandidate =
+              localModels.find((m) => m.isLoaded && !/embed|nomic/i.test(m.id)) || localModels[0];
+            if (localCandidate) {
+              resolvedModelName = localCandidate.id;
+              resolvedProvider = 'local';
+              resolvedFallbackNote = `Auto-Failover ke Local LM (${localCandidate.id}) karena Cloud API tidak merespons`;
+              showToast('success', resolvedFallbackNote);
+              await executeLocalStream(localCandidate.id);
+            } else {
+              throw geminiErr;
+            }
+          } else {
+            throw geminiErr;
+          }
+        }
+      } else if (effectiveProvider === 'openrouter') {
+        try {
+          await executeOpenRouterStream(activeModel || 'openrouter/free');
+        } catch (orErr: unknown) {
+          if (orErr instanceof Error && orErr.name === 'AbortError') throw orErr;
+          markModelCooldown(activeModel, 60000);
+
+          if (params.autoFallback && serverStatus.online && localModels.length > 0) {
+            const localCandidate =
+              localModels.find((m) => m.isLoaded && !/embed|nomic/i.test(m.id)) || localModels[0];
+            if (localCandidate) {
+              resolvedModelName = localCandidate.id;
+              resolvedProvider = 'local';
+              resolvedFallbackNote = `Auto-Failover ke Local LM (${localCandidate.id}) karena Cloud API tidak merespons`;
+              showToast('success', resolvedFallbackNote);
+              await executeLocalStream(localCandidate.id);
+            } else {
+              throw orErr;
+            }
+          } else {
+            throw orErr;
+          }
+        }
+      } else {
+        // LOCAL LM PROVIDER (with automatic Cloud Gemini Failover if PC/Cloudflare Tunnel is offline)
+        try {
+          await executeLocalStream(activeModel);
+        } catch (localErr: unknown) {
+          if (localErr instanceof Error && localErr.name === 'AbortError') throw localErr;
+          if (params.autoFallback) {
+            try {
+              resolvedModelName = 'gemini-2.5-flash';
+              resolvedProvider = 'gemini';
+              resolvedFallbackNote = `Auto-Failover ke Cloud Gemini (Server lokal ${params.serverUrl} tidak merespons)`;
+              showToast('success', 'Server lokal tidak merespons — beralih otomatis ke Cloud Gemini');
+              await executeGeminiStream('gemini-2.5-flash');
+            } catch {
+              // If Cloud Gemini also fails, report original local error clearly
+              throw localErr;
+            }
+          } else {
+            throw localErr;
+          }
+        }
       }
 
       streamFinished = true;
       if (rafId) cancelAnimationFrame(rafId);
-      updateAssistantInThread(targetText, targetReasoning);
+      updateAssistantInThread(targetText, targetReasoning, {
+        model: resolvedModelName,
+        provider: resolvedProvider,
+        fallbackNote: resolvedFallbackNote || undefined,
+      });
     } catch (err: unknown) {
       streamFinished = true;
       if (rafId) cancelAnimationFrame(rafId);
       if (err instanceof Error && err.name === 'AbortError') {
-        updateAssistantInThread(targetText + '\n\n*[Generasi dihentikan oleh pengguna]*', targetReasoning);
+        updateAssistantInThread(
+          targetText + '\n\n*[Generasi dihentikan oleh pengguna]*',
+          targetReasoning
+        );
       } else {
         const errMsg = err instanceof Error ? err.message : 'Koneksi gagal';
         showToast('error', errMsg);
         const targetLabel =
-          activeProvider === 'gemini'
+          effectiveProvider === 'gemini'
             ? 'Google Gemini Cloud API (/api/gemini/stream)'
-            : activeProvider === 'openrouter'
+            : effectiveProvider === 'openrouter'
             ? 'Cloud AI Proxy (/api/openrouter/stream)'
             : params.serverUrl;
         updateAssistantInThread(
@@ -1309,24 +1538,20 @@ export default function App() {
                 isOpen={modelPickerOpen}
                 onClose={() => setModelPickerOpen(false)}
                 activeProvider={activeProvider}
-                setActiveProvider={(nextProvider) => {
-                  setActiveProvider(nextProvider);
-                  const pool =
-                    nextProvider === 'local'
-                      ? localModels
-                      : DEFAULT_CLOUD_MODELS.filter((m) => m.provider === nextProvider);
-                  if (pool.length > 0 && !pool.some((m) => m.id === activeModel)) {
-                    setActiveModel(pool[0].id);
-                  }
-                }}
                 activeModel={activeModel}
                 onSelectModel={handleSelectModel}
                 localModels={localModels}
-                cloudModels={DEFAULT_CLOUD_MODELS}
+                cloudModels={cloudModels}
                 localFormat={localFormat}
                 isScanning={isScanning}
+                isScanningCloud={isScanningCloud}
                 isLoadingVram={isLoadingVram}
+                autoFallback={params.autoFallback}
+                onToggleAutoFallback={() =>
+                  setParams((p) => ({ ...p, autoFallback: !p.autoFallback }))
+                }
                 onScanLocal={() => scanLocalServer(false)}
+                onScanCloud={() => scanCloudModels(false)}
                 onOpenServerSettings={() => setServerModalOpen(true)}
               />
             </div>
@@ -1480,16 +1705,27 @@ export default function App() {
               className="chat-scroll-container flex-1 overflow-y-auto px-2.5 sm:px-6 lg:px-10 py-3 sm:py-6"
             >
               <div className="w-full max-w-5xl mx-auto space-y-4 sm:space-y-6">
-                {activeMessages.length > 0 &&
-                  activeMessages.map((msg, idx) => {
-                    const isUser = msg.role === 'user';
-                    const isLastAiStreaming =
-                      isStreaming && !isUser && idx === activeMessages.length - 1;
-                    const detectedArtifact = !isUser ? extractCodeArtifact(msg.content) : null;
+                <AnimatePresence key={activeThreadId || 'empty'} initial={false}>
+                  {activeMessages.length > 0 &&
+                    activeMessages.map((msg, idx) => {
+                      const isUser = msg.role === 'user';
+                      const isLastAiStreaming =
+                        isStreaming && !isUser && idx === activeMessages.length - 1;
+                      const detectedArtifact = !isUser ? extractCodeArtifact(msg.content) : null;
 
-                    return (
-                      <div key={msg.id || idx} className="group">
-                        {isUser ? (
+                      return (
+                        <motion.div
+                          key={msg.id || idx}
+                          initial={{ opacity: 0, y: 12, scale: 0.99 }}
+                          animate={{ opacity: 1, y: 0, scale: 1 }}
+                          exit={{ opacity: 0, y: -6, transition: { duration: 0.15 } }}
+                          transition={{
+                            duration: 0.28,
+                            ease: [0.22, 1, 0.36, 1],
+                          }}
+                          className="group will-change-transform"
+                        >
+                          {isUser ? (
                           <div className="flex flex-col items-end">
                             <div className="user-chat-bubble max-w-[90%] sm:max-w-[78%] rounded-xl bg-[var(--accent)] text-white px-3 py-2 sm:px-4 sm:py-2.5 text-[12.5px] sm:text-[14px] leading-relaxed shadow-2xs break-words">
                               <div className="whitespace-pre-wrap">{msg.content}</div>
@@ -1594,6 +1830,14 @@ export default function App() {
                                     {msg.model}
                                   </span>
                                 )}
+                                {msg.fallbackNote && (
+                                  <span
+                                    title={msg.fallbackNote}
+                                    className="px-1.5 py-0.5 rounded-[3px] bg-amber-500/12 text-amber-700 dark:text-amber-300 font-mono text-[9px] sm:text-[10px] truncate max-w-[200px] sm:max-w-[320px]"
+                                  >
+                                    {msg.fallbackNote}
+                                  </span>
+                                )}
                                 {params.showTimestamps && msg.time && (
                                   <span className="font-mono-tabular text-[9.5px] sm:text-[10.5px] text-[var(--text-muted)]">
                                     ·{' '}
@@ -1607,25 +1851,34 @@ export default function App() {
                             )}
                           </div>
                         )}
-                      </div>
-                    );
-                  })}
+                          </motion.div>
+                      );
+                    })}
+                </AnimatePresence>
               </div>
             </div>
 
             {/* Floating "↓ Ke Bawah" Button */}
-            {showScrollBottomBtn && (
-              <div className="absolute bottom-14 sm:bottom-16 left-1/2 -translate-x-1/2 z-20">
-                <button
-                  type="button"
-                  onClick={() => scrollToBottom(true)}
-                  className="px-3 py-1 sm:px-3.5 sm:py-1.5 rounded-full bg-[#2B2927] hover:bg-[#1C1B1A] text-white text-[11px] sm:text-xs font-semibold shadow-lg flex items-center gap-1.5 border border-white/10 btn-tactile cursor-pointer"
+            <AnimatePresence>
+              {showScrollBottomBtn && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10, scale: 0.94 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 8, scale: 0.94 }}
+                  transition={{ duration: 0.18, ease: [0.22, 1, 0.36, 1] }}
+                  className="absolute bottom-14 sm:bottom-16 left-1/2 -translate-x-1/2 z-20"
                 >
-                  <ArrowDown className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-[var(--accent)]" />
-                  <span>Ke Bawah</span>
-                </button>
-              </div>
-            )}
+                  <button
+                    type="button"
+                    onClick={() => scrollToBottom(true)}
+                    className="px-3 py-1 sm:px-3.5 sm:py-1.5 rounded-full bg-[#2B2927] hover:bg-[#1C1B1A] text-white text-[11px] sm:text-xs font-semibold shadow-lg flex items-center gap-1.5 border border-white/10 btn-tactile cursor-pointer"
+                  >
+                    <ArrowDown className="w-3 h-3 sm:w-3.5 sm:h-3.5 text-[var(--accent)]" />
+                    <span>Ke Bawah</span>
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Conditional Status & Attachment Preview Bar */}
             {(attachments.length > 0 || isRecording || deepReasoningEnabled || webSearchEnabled) && (

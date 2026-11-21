@@ -1,4 +1,6 @@
-import type { Request, Response } from 'express';
+export const config = {
+  runtime: 'edge',
+};
 
 function normalizeEndpoint(raw: string): string {
   let url = (raw || '').trim();
@@ -31,9 +33,10 @@ interface DetectedModel {
   family?: string;
 }
 
-export default async function handler(req: Request, res: Response) {
-  const rawEndpoint = String(req.query.endpoint || 'https://api.vinns.my.id');
-  const apiKey = String(req.query.apiKey || '');
+export default async function handler(req: Request): Promise<Response> {
+  const urlObj = new URL(req.url);
+  const rawEndpoint = urlObj.searchParams.get('endpoint') || 'https://api.vinns.my.id';
+  const apiKey = urlObj.searchParams.get('apiKey') || '';
   const baseUrl = normalizeEndpoint(rawEndpoint);
   const startMs = Date.now();
 
@@ -165,29 +168,38 @@ export default async function handler(req: Request, res: Response) {
 
     const models = Array.from(modelsMap.values());
     if (models.length === 0) {
-      return res.status(502).json({
-        ok: false,
-        endpoint: baseUrl,
-        latencyMs,
-        error:
-          cfErrorMsg ||
-          `Tidak dapat menemukan model aktif di ${baseUrl}. Pastikan LM Studio / Ollama dan Cloudflare Tunnel sedang berjalan.`,
-      });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          endpoint: baseUrl,
+          latencyMs,
+          error:
+            cfErrorMsg ||
+            `Tidak dapat menemukan model aktif di ${baseUrl}. Pastikan LM Studio / Ollama dan Cloudflare Tunnel sedang berjalan.`,
+        }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } }
+      );
     }
 
-    return res.json({
-      ok: true,
-      endpoint: baseUrl,
-      providerFormat: detectedFormat,
-      latencyMs,
-      models,
-    });
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        endpoint: baseUrl,
+        providerFormat: detectedFormat,
+        latencyMs,
+        models,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown connection error';
-    return res.status(502).json({
-      ok: false,
-      endpoint: baseUrl,
-      error: `Koneksi gagal ke ${baseUrl}: ${message}`,
-    });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        endpoint: baseUrl,
+        error: `Koneksi gagal ke ${baseUrl}: ${message}`,
+      }),
+      { status: 502, headers: { 'Content-Type': 'application/json' } }
+    );
   }
 }

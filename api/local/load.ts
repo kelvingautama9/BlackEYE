@@ -1,4 +1,6 @@
-import type { Request, Response } from 'express';
+export const config = {
+  runtime: 'edge',
+};
 
 function normalizeEndpoint(raw: string): string {
   let url = (raw || '').trim();
@@ -10,20 +12,33 @@ function normalizeEndpoint(raw: string): string {
   return url.replace(/\/+$/, '').replace(/\/v1$/i, '');
 }
 
-export default async function handler(req: Request, res: Response) {
+export default async function handler(req: Request): Promise<Response> {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method Not Allowed' });
+    return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
+      status: 405,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
-  const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body || {};
-  const { endpoint, apiKey, modelId, providerFormat } = body as {
+  let body: {
     endpoint?: string;
     apiKey?: string;
     modelId?: string;
     providerFormat?: string;
-  };
+  } = {};
+
+  try {
+    body = (await req.json()) || {};
+  } catch {
+    body = {};
+  }
+
+  const { endpoint, apiKey, modelId, providerFormat } = body;
   if (!modelId) {
-    return res.status(400).json({ ok: false, error: 'modelId wajib diisi' });
+    return new Response(JSON.stringify({ ok: false, error: 'modelId wajib diisi' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   const baseUrl = normalizeEndpoint(endpoint || 'https://api.vinns.my.id');
@@ -39,7 +54,10 @@ export default async function handler(req: Request, res: Response) {
         body: JSON.stringify({ model: modelId, keep_alive: '15m', prompt: '' }),
       });
       if (r.ok) {
-        return res.json({ ok: true, modelId, latencyMs: Date.now() - startMs });
+        return new Response(
+          JSON.stringify({ ok: true, modelId, latencyMs: Date.now() - startMs }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
       }
     }
 
@@ -50,7 +68,10 @@ export default async function handler(req: Request, res: Response) {
         body: JSON.stringify({ modelKey: modelId, identifier: modelId }),
       });
       if (r.ok) {
-        return res.json({ ok: true, modelId, latencyMs: Date.now() - startMs });
+        return new Response(
+          JSON.stringify({ ok: true, modelId, latencyMs: Date.now() - startMs }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
       }
     }
 
@@ -67,15 +88,24 @@ export default async function handler(req: Request, res: Response) {
 
     if (!warmup.ok) {
       const errText = await warmup.text();
-      return res.status(warmup.status).json({
-        ok: false,
-        error: `Gagal memuat model ke VRAM (${warmup.status}): ${errText}`,
-      });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: `Gagal memuat model ke VRAM (${warmup.status}): ${errText}`,
+        }),
+        { status: warmup.status, headers: { 'Content-Type': 'application/json' } }
+      );
     }
 
-    return res.json({ ok: true, modelId, latencyMs: Date.now() - startMs });
+    return new Response(
+      JSON.stringify({ ok: true, modelId, latencyMs: Date.now() - startMs }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    );
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Gagal memuat model';
-    return res.status(502).json({ ok: false, error: message });
+    return new Response(JSON.stringify({ ok: false, error: message }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
